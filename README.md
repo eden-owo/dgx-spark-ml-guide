@@ -11,8 +11,8 @@
 |---------------------|----------------------------------------------------------------------|
 | **Author** | **Martim Ramos** —  DevOps Lead @ AXA (The Lead tha codes 90%+ of the time.)  |
 | **Hardware** | NVIDIA DGX Spark with GB10 (Blackwell architecture, sm_121) |
-| **Last Updated** | January 2025 |
-| **Verified Working** | Video generation, lip-sync avatars, image diffusion, music LoRA training |
+| **Last Updated** | April 2026 |
+| **Verified Working** | Video generation, lip-sync avatars, image diffusion, music LoRA training, **Chatterbox TTS (multilingual zero-shot voice cloning, incl. PT-PT)** |
 | **License** | MIT |
 
 ---
@@ -47,6 +47,10 @@ pip install --pre torch torchvision torchaudio --index-url https://download.pyto
 **If you're using MMLab (mmcv, mmdet, mmpose):** You need Docker with Python 3.10. See [Challenge 4](#challenge-4-python-312-breaks-mmlab-stack).
 
 **If builds fail with CUDA errors:** Your system has CUDA 13.0 but PyTorch uses 12.8. See [Challenge 2](#challenge-2-cuda-version-mismatch-when-compiling-extensions).
+
+**If your model fails at runtime with `nvrtc: error: invalid value for --gpu-architecture`** (typical for TTS / audio / FFT pipelines): the bundled NVRTC doesn't know sm_121. See [Challenge 14](#challenge-14-runtime-nvrtc-error-bundled-libnvrtcso12-doesnt-know-sm_121).
+
+**If a project's `pyproject.toml` pins `torch==2.6.0`** (Chatterbox-TTS, older XTTS, many HF repos): a normal install will silently clobber your cu128 nightly. Use `--no-deps`. See [Challenge 15](#challenge-15-project-pins-torch260-and-clobbers-your-cu128-nightly).
 
 ---
 
@@ -259,26 +263,52 @@ Add this before any model loading code runs.
 
 ---
 
-## Challenge 6: NGC Containers Don't Support GB10
+## Challenge 6: NGC PyTorch Containers and GB10 — Status as of April 2026
 
-### What error will I see?
+### Short version
+
+| NGC tag | GB10 (sm_121) support | Recommended? |
+|---------|------------------------|---------------|
+| `nvcr.io/nvidia/pytorch:24.10-py3` and earlier | ❌ No | No |
+| `nvcr.io/nvidia/pytorch:25.10-py3` and later | ✅ **Yes** | **Yes — often the cleanest path** |
+
+### What error will I see on old NGC images?
 
 ```
 WARNING: Detected NVIDIA GB10 GPU, which is not yet supported
 ```
 
-### How do I fix it?
+### What ships in the working `pytorch:25.10-py3` image?
 
-Don't use NGC PyTorch containers. Use base CUDA images instead:
+Verified inside the running container on GB10:
 
-```dockerfile
-# ❌ Don't use:
-FROM nvcr.io/nvidia/pytorch:24.10-py3
-
-# ✅ Use instead:
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
-# Then install PyTorch nightly manually
+```text
+torch: 2.9.0a0+145a3a7bda.nv25.10
+cuda: True
+device: NVIDIA GB10
+cap: (12, 1)
+arch_list: ['sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_110', 'sm_120', 'compute_120']
 ```
+
+Container CUDA: `13.0.88` (matches host). Container NVRTC: `libnvrtc.so.13` (matches host). The `compute_120` PTX JITs to sm_121 cleanly — meaning the runtime ops that break the cu128-nightly venv path (see [Challenge 14](#challenge-14-runtime-nvrtc-error-bundled-libnvrtcso12-doesnt-know-sm_121)) **just work** here:
+
+```python
+>>> torch.randn(1024, dtype=torch.complex64, device="cuda").abs()              # OK
+>>> torch.fft.rfft(torch.randn(2048, device="cuda")).abs()                     # OK
+```
+
+### When should I use NGC vs the venv-with-cu128-nightly approach?
+
+- **Use NGC `pytorch:25.10-py3`+** when you want a single, NVIDIA-tested CUDA + cuDNN + NVRTC + torch stack and don't care about a ~10–30 GB image. **No** torch nightly. **No** NVRTC symlink. **No** `--no-deps` dance for torch-pinning projects (because NGC's torch isn't on PyPI's resolver radar).
+- **Use the venv path** when you need a small image, want bleeding-edge nightly features, or are building inside an existing non-NGC base.
+
+### How do I use NGC for ComfyUI specifically?
+
+See [Challenge 16](#challenge-16-comfyui-on-dgx-spark-the-official-playbook-is-fragile-use-ngc).
+
+### Old advice (kept for context)
+
+Earlier versions of this guide recommended `nvidia/cuda:12.8.0-devel-ubuntu22.04` plus a manual PyTorch nightly install, because NGC PyTorch ≤24.10 didn't support sm_121. That guidance is now stale for new builds — use NGC ≥25.10 if you want the easiest GB10 stack.
 
 ---
 
@@ -488,6 +518,276 @@ services:
 
 ---
 
+## Challenge 14: Runtime NVRTC Error — Bundled libnvrtc.so.12 Doesn't Know sm_121
+
+This is the most-missed gotcha on GB10 in 2026. It does **not** trigger at install time and `torch.cuda.is_available()` returns `True`. It hits the first time your model runs an op that needs JIT codegen — common in audio / TTS / ASR / FFT pipelines.
+
+### What error will I see?
+
+```
+nvrtc: error: invalid value for --gpu-architecture (-arch)
+```
+
+…buried at the bottom of a long traceback that includes generated CUDA source like:
+
+```
+abs_kernel<std::complex<float>>(arg0[j])
+```
+
+The traceback typically passes through `torch.fft.rfft(...).abs()`, `torchaudio.compliance.kaldi.fbank`, `torchaudio.transforms.MelSpectrogram`, or any custom GPU pipeline that does `complex.abs()`.
+
+### Why does this happen?
+
+PyTorch nightly `cu128` ships its own NVRTC at:
+
+```
+<venv>/lib/python3.X/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12
+```
+
+That bundled NVRTC is from CUDA 12.8 — released before Blackwell GB10 — and **does not recognize sm_121** as a valid `--gpu-architecture` value.
+
+`torch.cuda.get_arch_list()` confirms it:
+
+```python
+>>> import torch
+>>> torch.cuda.get_device_capability(0)
+(12, 1)
+>>> torch.cuda.get_arch_list()
+['sm_80', 'sm_90', 'sm_100', 'sm_120']   # sm_121 missing
+```
+
+Pre-compiled ATen kernels for `sm_120` run on GB10 (forward compatible). But the moment PyTorch's **jiterator** falls back to NVRTC for an uncommon type combo (notably `abs(complex64)` returned by FFT ops), it asks NVRTC to generate **sm_121** code — and the bundled 12.8 lib errors out.
+
+### How do I fix it?
+
+Replace the bundled NVRTC 12 with a symlink to the system NVRTC 13 (CUDA 13.0 ships one that knows sm_121). The C ABI is stable enough across this version gap that PyTorch's `dlopen` + `dlsym` still resolves what it needs:
+
+```bash
+cd <venv>/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib
+mv libnvrtc.so.12 libnvrtc.so.12.orig
+ln -s /usr/local/cuda-13.0/lib64/libnvrtc.so.13 libnvrtc.so.12
+```
+
+For Docker images, do the same inside the container's site-packages.
+
+### How do I verify the fix?
+
+```bash
+python3 -c "
+import torch, torchaudio.compliance.kaldi as Kaldi
+au = torch.randn(16000).cuda()
+out = Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80)
+print('fbank OK on', out.device, 'shape', tuple(out.shape))
+"
+```
+
+Without the fix: NVRTC arch error.
+With the fix: `fbank OK on cuda:0 shape (98, 80)`.
+
+### Why not patch the jiterator?
+
+Jiterator is C++ side; the device cap is read from `at::cuda::getCurrentDeviceProperties()->major/minor`. Overriding it requires patching `libtorch_cuda.so`. The NVRTC symlink is the smallest change that unblocks the widest set of ops.
+
+### Will this be needed forever?
+
+No — once PyTorch nightly bumps its bundled NVRTC to 13.x (which natively knows sm_121), this becomes unnecessary. As of April 2026, the symlink is still required.
+
+---
+
+## Challenge 15: Project Pins `torch==2.6.0` and Clobbers Your cu128 Nightly
+
+### Which projects hit this?
+
+Many TTS, ASR, and diffusion repos pin specific torch versions in `pyproject.toml` or `requirements.txt`. Common offenders:
+
+- `chatterbox-tts` (pins `torch==2.6.0`, `torchaudio==2.6.0`, `numpy<2.0.0`)
+- Older XTTS / Coqui-TTS forks
+- Many HuggingFace example repos and demo apps
+
+### What happens if I install normally?
+
+`pip install <project>` will resolve the pinned `torch==2.6.0`, find no `aarch64 + cu128` wheel for it, and silently fall back to `torch==2.6.0+cpu` (or fail outright). You lose GB10 acceleration without an obvious error.
+
+### How do I install without breaking torch?
+
+Install the package itself with `--no-deps`, then re-install its dependencies individually (omitting the torch/torchaudio/numpy pins):
+
+```bash
+# 1. Project itself, no deps
+pip install -e ./chatterbox --no-deps
+
+# 2. Reinstall the other deps (skip torch/torchaudio/numpy pins)
+pip install librosa s3tokenizer transformers diffusers conformer safetensors \
+            spacy-pkuseg pykakasi pyloudnorm omegaconf \
+            'resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master'
+
+# 3. Pin onnx==1.16.0 if onnx is in the tree
+#    (pre-built aarch64 wheel exists; later versions try to build from source)
+pip install onnx==1.16.0
+```
+
+`pip` will print `dependency resolver does not currently take into account...` warnings about torch/numpy version mismatches. **These are expected and harmless** — pip's resolver doesn't model `aarch64 + cu128` reality.
+
+### How do I verify torch is still on cu128?
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expected: 2.12.0.dev...+cu128 True NVIDIA GB10
+```
+
+If it prints `+cpu` or a `2.6.0` version, the install clobbered torch — re-do step 1 with `--no-deps`.
+
+---
+
+## Challenge 16: ComfyUI on DGX Spark — The Official Playbook Is Fragile, Use NGC
+
+### What's the official playbook and why does it break?
+
+NVIDIA publishes a [DGX Spark ComfyUI playbook](https://github.com/nvidia/dgx-spark-playbooks/tree/main/nvidia/comfy-ui) that walks you through a **host-venv** install:
+
+```bash
+python3 -m venv comfyui-env
+source comfyui-env/bin/activate
+
+# Step 3: install torch
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# Step 5 (after cloning ComfyUI):
+pip install -r requirements.txt
+```
+
+The playbook is **fragile** for three reasons:
+
+1. **Step 5 can silently overwrite Step 3.** If ComfyUI's `requirements.txt` (or any custom node's `requirements.txt`) pins a different `torch` / `torchvision` / `torchaudio`, `pip install -r requirements.txt` resolves to that pin and replaces the GB10-capable wheels you just installed. ComfyUI mainline currently does not pin torch — but **most popular custom nodes do**, and the moment you install one, your torch can be downgraded.
+2. **Nothing handles the bundled-NVRTC sm_121 issue** — see [Challenge 14](#challenge-14-runtime-nvrtc-error-bundled-libnvrtcso12-doesnt-know-sm_121). PyPI torch wheels (cu128 *and* cu130) ship NVRTC older than CUDA 13's, so any custom node that runs FFT-based ops on GPU can crash at runtime even after a "successful" install.
+3. **Memory advice is too coarse** — `echo 3 > /proc/sys/vm/drop_caches` helps in some cases, but real GB10 OOMs come from custom nodes accumulating model state. The playbook doesn't mention `--lowvram`, `--cpu-vae`, or unified-memory implications (see Challenge 8).
+
+### What error will I see when the playbook breaks?
+
+After installing a custom node, ComfyUI starts but runs on CPU:
+
+```
+Set vram state to: DISABLED
+Device: cpu
+```
+
+Or, on the first GPU op:
+
+```
+torch.cuda.is_available() = False
+```
+
+Or, if torch is still GPU-capable but a custom node uses FFT/complex ops:
+
+```
+nvrtc: error: invalid value for --gpu-architecture (-arch)
+```
+
+(That last one is Challenge 14, hit through a different door.)
+
+Diagnostic one-liner:
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+```
+
+If you see `+cpu` or `False`, your torch was clobbered.
+
+### How do I fix it? Containerize on NGC.
+
+Use this Dockerfile — verified working on GB10 in production:
+
+```dockerfile
+FROM nvcr.io/nvidia/pytorch:25.10-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN useradd -m -u 1100 comfy
+WORKDIR /home/comfy
+
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /home/comfy/ComfyUI
+WORKDIR /home/comfy/ComfyUI
+
+# CRITICAL: Strip torch / torchvision / torchaudio from requirements.txt
+# BEFORE pip install, so NGC's GB10-capable torch is preserved.
+# The regex is precise: it does NOT match torchsde (needed by samplers).
+RUN sed -i '/^torch[>=< ]/d; /^torch$/d; /^torchvision/d; /^torchaudio/d' requirements.txt \
+    && pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /home/comfy/ComfyUI/models/checkpoints \
+              /home/comfy/ComfyUI/output \
+    && chown -R comfy:comfy /home/comfy
+
+USER comfy
+EXPOSE 8188
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
+```
+
+### Why the sed regex matters (don't simplify it)
+
+ComfyUI samplers depend on `torchsde`. The naive simplification `grep -v torch` (or `sed '/torch/d'`) **removes torchsde too** and silently breaks several samplers (DPM++ SDE, DPM2 a, etc.) at workflow runtime — long after install. The four-pattern regex strips exactly:
+
+- `^torch[>=< ]` — `torch>=2.0`, `torch <3`, `torch ==2.6.0`, etc.
+- `^torch$` — the bare `torch`
+- `^torchvision` — any `torchvision*` line
+- `^torchaudio` — any `torchaudio*` line
+
+…and leaves `torchsde`, `torchmetrics`, `torch-something-else` alone. Even on current ComfyUI (which doesn't pin torch in mainline `requirements.txt`), keep the sed line as defense — custom node `requirements.txt` files are a moving target.
+
+### docker-compose.yml snippet
+
+```yaml
+services:
+  comfyui:
+    build: ./back/comfyui
+    container_name: bard-comfyui
+    ports:
+      - "8188:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - /opt/ai-models/comfyui:/home/comfy/ComfyUI/models
+      - ./output:/home/comfy/ComfyUI/output
+```
+
+(`runtime: nvidia` does not work — see [Challenge 10](#challenge-10-docker-runtime-configuration).)
+
+### How do I verify the container is actually using the GPU?
+
+```bash
+docker exec -it bard-comfyui python3 -c "
+import torch
+print('torch:', torch.__version__)
+print('cuda:', torch.cuda.is_available())
+print('device:', torch.cuda.get_device_name(0))
+print('cap:', torch.cuda.get_device_capability(0))
+"
+```
+
+Expected output:
+
+```
+torch: 2.9.0a0+145a3a7bda.nv25.10
+cuda: True
+device: NVIDIA GB10
+cap: (12, 1)
+```
+
+### What about container size?
+
+The image is ~30 GB (NGC base is large). If that's a problem, use the venv + cu128 nightly + NVRTC symlink approach — but accept that custom nodes will more frequently break your install.
+
+### What about exit code 137?
+
+That's the kernel OOM killer, not an install issue. GB10's 128 GB unified memory is shared with the host — large workflows + a heavy host workload can hit the cap. Mitigations: launch ComfyUI with `--lowvram` or `--normalvram`, avoid loading multiple checkpoints simultaneously, and see [Challenge 8](#challenge-8-understanding-unified-memory) for unified-memory specifics.
+
+---
+
 ## Quick Reference: Error → Solution Table
 
 | Error Message | Cause | Solution |
@@ -504,6 +804,12 @@ services:
 | `No module named 'transformers.modeling_layers'` | peft/transformers mismatch | Pin peft to compatible version |
 | `No matching distribution for spacy==X.X.X` | Pinned spacy lacks ARM64 wheel | Use `spacy>=3.7.0` |
 | `TorchCodec is required` | torchaudio nightly needs TorchCodec | Use `soundfile` for audio I/O |
+| `nvrtc: error: invalid value for --gpu-architecture` (runtime) | Bundled NVRTC 12.8 doesn't know sm_121 | Symlink system NVRTC 13 — see [Challenge 14](#challenge-14-runtime-nvrtc-error-bundled-libnvrtcso12-doesnt-know-sm_121) |
+| Silent torch downgrade to `2.6.0+cpu` after `pip install` | Project pins `torch==2.6.0` | Install with `--no-deps` — see [Challenge 15](#challenge-15-project-pins-torch260-and-clobbers-your-cu128-nightly) |
+| `abs_kernel<std::complex<float>>` in CUDA codegen traceback | Jiterator NVRTC codegen for sm_121 | Same fix as Challenge 14 |
+| ComfyUI: `Set vram state to: DISABLED` / `Device: cpu` after install | Custom node's `requirements.txt` clobbered torch | Use NGC `pytorch:25.10-py3` + sed-strip torch/torchvision/torchaudio — see [Challenge 16](#challenge-16-comfyui-on-dgx-spark-the-official-playbook-is-fragile-use-ngc) |
+| Samplers (DPM++ SDE, DPM2 a) fail at workflow runtime | `torchsde` accidentally stripped by `grep -v torch` | Use precise regex: `^torch[>=< ]`, `^torch$`, `^torchvision`, `^torchaudio` only |
+| `WARNING: Detected NVIDIA GB10 GPU, which is not yet supported` (NGC) | Old NGC image (≤24.10) | Upgrade to `nvcr.io/nvidia/pytorch:25.10-py3` or later — see [Challenge 6](#challenge-6-ngc-pytorch-containers-and-gb10--status-as-of-april-2026) |
 | `Target modules X not found in base model` | LoRA config has invalid module names | Inspect model with `model.named_modules()` |
 | DataLoader workers use excessive memory | Workers fork entire process state | Set `num_workers=0` |
 | `platform (linux/amd64) does not match` | Docker image is x86_64 only | Use ARM64-native image |
@@ -593,7 +899,7 @@ services:
 
 ## Verified Working Configurations
 
-These configurations have been tested and verified working on DGX Spark by Martim Gaspar:
+These configurations have been tested and verified working on DGX Spark by Martim Ramos:
 
 ### Video Generation (Diffusion Models)
 - **Approach:** Python venv with PyTorch nightly
@@ -622,6 +928,27 @@ These configurations have been tested and verified working on DGX Spark by Marti
 - **Performance:** ~3.2 seconds/iteration, 96% GPU utilization
 - **Status:** Training and inference working
 
+### ComfyUI (image / video diffusion workflows)
+- **Approach:** Docker on `nvcr.io/nvidia/pytorch:25.10-py3` (NGC)
+- **Image size:** ~30 GB
+- **Why NGC:** Ships torch `2.9.0a0+...nv25.10` with sm_120 + compute_120 PTX, CUDA 13.0, NVRTC 13.0 — verified to run `complex.abs()`, `torch.fft.rfft().abs()`, and other jiterator-codegen ops on GB10 with no patching
+- **Key fixes applied:**
+  - `sed -i '/^torch[>=< ]/d; /^torch$/d; /^torchvision/d; /^torchaudio/d' requirements.txt` before `pip install -r requirements.txt` — preserves NGC's torch while keeping torchsde
+  - Non-root user (UID 1100) for safety
+  - `deploy.resources.reservations` in compose (not `runtime: nvidia`)
+- **Status:** Working in production; full Dockerfile in [Challenge 16](#challenge-16-comfyui-on-dgx-spark-the-official-playbook-is-fragile-use-ngc)
+
+### TTS — Chatterbox Multilingual (zero-shot voice cloning, PT-PT)
+- **Approach:** Python venv (3.12) with PyTorch nightly cu128
+- **Key fixes applied:**
+  - Chatterbox installed with `--no-deps` to keep cu128 nightly (Challenge 15)
+  - Reinstalled deps individually; `onnx==1.16.0` pinned for aarch64 wheel
+  - System `libnvrtc.so.13` symlinked over bundled `libnvrtc.so.12` (Challenge 14) — fixes runtime crash in `Kaldi.fbank` / `log_mel_spectrogram` during reference encoding
+  - `soundfile.write` instead of `torchaudio.save` for output (Challenge 12)
+- **Performance:** ~50 sampling steps/sec for the t3 sampler on GB10
+- **Verified:** Full PT-PT zero-shot generation from a 15s reference clip; output at 24 kHz
+- **Status:** Working end-to-end
+
 ---
 
 ## Decision Tree: Which Setup Do I Need?
@@ -643,6 +970,15 @@ Starting a new ML project on DGX Spark?
 │
 ├─ Does it need audio loading/saving?
 │   ├─ YES → Use soundfile instead of torchaudio
+│   └─ NO  → Continue below
+│
+├─ Does it run FFT / mel-spectrogram / complex tensors on GPU?
+│  (TTS, ASR, audio diffusion all do)
+│   ├─ YES → Symlink system NVRTC 13 over bundled NVRTC 12 (Challenge 14)
+│   └─ NO  → Continue below
+│
+├─ Does its pyproject.toml pin torch==2.6.0 (or any older torch)?
+│   ├─ YES → pip install --no-deps, then reinstall deps manually (Challenge 15)
 │   └─ NO  → Continue below
 │
 ├─ Does it pin specific package versions?
@@ -690,6 +1026,30 @@ Partially. The PyTorch nightly + CUDA 12.8 approach should work for any Blackwel
 
 DataLoader workers fork the entire process state. On DGX Spark with large models already loaded, this can exhaust memory quickly. Set `num_workers=0` to load data in the main process.
 
+### Why does my TTS / audio model crash with `nvrtc: error: invalid value for --gpu-architecture`?
+
+The bundled NVRTC 12.8 in PyTorch nightly doesn't know GB10's sm_121 arch. As soon as the jiterator JIT-compiles a kernel for an uncommon type combo (e.g. `.abs()` on a complex tensor returned by `torch.fft.rfft`, used inside `Kaldi.fbank` and most mel-spectrogram code), NVRTC errors out. Symlink the system `libnvrtc.so.13` over the bundled `libnvrtc.so.12` — see [Challenge 14](#challenge-14-runtime-nvrtc-error-bundled-libnvrtcso12-doesnt-know-sm_121).
+
+### Can I run Chatterbox-TTS on DGX Spark?
+
+Yes. Install with `--no-deps` (it pins `torch==2.6.0` which would clobber the cu128 nightly), reinstall dependencies individually, do the NVRTC 13 symlink, and use `soundfile.write` instead of `torchaudio.save`. See the **Chatterbox Multilingual** entry under [Verified Working Configurations](#verified-working-configurations).
+
+### How do I install a Python package whose pyproject.toml pins old PyTorch?
+
+Use `pip install <project> --no-deps`, then reinstall the rest of its dependencies manually, omitting the torch/torchaudio/numpy pins. See [Challenge 15](#challenge-15-project-pins-torch260-and-clobbers-your-cu128-nightly).
+
+### Does the official NVIDIA ComfyUI playbook for DGX Spark actually work?
+
+It works on a clean machine with default ComfyUI and no custom nodes. As soon as you install custom nodes (which is most of why people use ComfyUI), their `requirements.txt` files can silently clobber the torch you installed — leaving you on CPU. Use the NGC + sed approach in [Challenge 16](#challenge-16-comfyui-on-dgx-spark-the-official-playbook-is-fragile-use-ngc) instead.
+
+### Should I use NGC PyTorch or pip-install nightly cu128 on DGX Spark?
+
+NGC `pytorch:25.10-py3`+ is the cleanest path: matches the host's CUDA 13.0 and NVRTC 13.0, ships sm_120 + compute_120 PTX (which JITs to sm_121), and avoids the `--no-deps` and NVRTC-symlink dances entirely. Trade-off: ~30 GB image. Use cu128 nightly + symlink when you need a small image or bleeding-edge features. See [Challenge 6](#challenge-6-ngc-pytorch-containers-and-gb10--status-as-of-april-2026).
+
+### My ComfyUI samplers (DPM++ SDE, DPM2 a) suddenly stop working after a Docker rebuild — why?
+
+You probably stripped `torchsde` along with `torch` from `requirements.txt`. Use the precise regex from [Challenge 16](#challenge-16-comfyui-on-dgx-spark-the-official-playbook-is-fragile-use-ngc): `^torch[>=< ]`, `^torch$`, `^torchvision`, `^torchaudio` — not `grep -v torch`.
+
 ### How do I get help if I'm stuck?
 
 1. Check the [PyTorch DGX Spark Discussion Thread](https://discuss.pytorch.org/t/dgx-spark-gb10-cuda-13-0-python-3-12-sm-121/223744)
@@ -720,6 +1080,12 @@ This guide was written after spending 72+ hours debugging DGX Spark issues acros
 
 | Date | Changes |
 |------|---------|
+| April 2026 | Added Challenge 16 (ComfyUI on DGX Spark — NGC + precise sed regex; official playbook is fragile) |
+| April 2026 | Rewrote Challenge 6 — NGC `pytorch:25.10-py3`+ now supports GB10 (verified: torch `2.9.0a0+...nv25.10`, CUDA 13.0, NVRTC 13.0, compute_120 PTX) |
+| April 2026 | Added Challenge 14 (NVRTC bundled lib doesn't know sm_121 — runtime fix for TTS/audio/FFT pipelines) |
+| April 2026 | Added Challenge 15 (`--no-deps` recipe for projects pinning `torch==2.6.0`, e.g. Chatterbox-TTS) |
+| April 2026 | Added Verified Configurations: Chatterbox Multilingual TTS (PT-PT) and ComfyUI (NGC) |
+| April 2026 | Expanded error table, decision tree, and FAQ with NVRTC/jiterator, torch-pin, and ComfyUI scenarios |
 | January 2025 | Added Challenge 12 (TorchCodec) and Challenge 13 (TensorBoard ARM64) |
 | January 2025 | Added music LoRA training configuration with performance benchmarks |
 | January 2025 | Expanded error table with DataLoader memory and LoRA module errors |
@@ -737,4 +1103,4 @@ Found a new issue? Discovered a better solution? Contributions welcome:
 
 ---
 
-*This guide is maintained by Martim Ramos. Last verified on NVIDIA DGX Spark with GB10 (Blackwell), January 2025.*
+*This guide is maintained by Martim Ramos. Last verified on NVIDIA DGX Spark with GB10 (Blackwell), April 2026.*
